@@ -1,3 +1,5 @@
 *.dol
 *.elf
+*.dtm
+*.sav
 build/
