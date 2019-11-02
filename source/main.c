@@ -8,37 +8,11 @@
 #include <string.h>
 #include <unistd.h>
 
-#define ticks_to_us(ticks) ((((u64)(ticks)*8)/(u64)(TB_TIMER_CLOCK/125)))
-#define ticks_to_ms(ticks)    (((u64)(ticks)/(u64)(TB_TIMER_CLOCK)))
-
-u32 gettick(void);
-u64 gettime(void);
+#define ticks_to_us(ticks)	((((u64)(ticks)*8)/(u64)(TB_TIMER_CLOCK/125)))
+#define ticks_to_ms(ticks)	(((u64)(ticks)/(u64)(TB_TIMER_CLOCK)))
 
 static void *xfb = NULL;
 static GXRModeObj *rmode = NULL;
-void init()
-{
-	VIDEO_Init();
-	PAD_Init();
-	rmode = VIDEO_GetPreferredMode(NULL);
-
-	xfb = MEM_K0_TO_K1(SYS_AllocateFramebuffer(rmode));
-	console_init(xfb, 20, 20, rmode->fbWidth, rmode->xfbHeight, 
-			rmode->fbWidth*VI_DISPLAY_PIX_SZ);
-
-	VIDEO_Configure(rmode);
-	VIDEO_SetNextFramebuffer(xfb);
-	VIDEO_SetBlack(FALSE);
-	VIDEO_Flush();
-
-	VIDEO_WaitVSync();
-	if(rmode->viTVMode&VI_NON_INTERLACE) 
-		VIDEO_WaitVSync();
-}
-
-/* This is basically all of our state.
- */
-
 
 static u32 frame_ctr;			// The current frame number
 static u32 total_clicks;		// The total number of clicks
@@ -48,11 +22,12 @@ static u32 window_start_ts;		// Timestamp of window start in ticks
 static u32 last_window_start_ts;	// Timestamp of previous window start
 static float last_window_time_us;	// Length of previous window in us
 
-static u32 downtime_ts;
-static float last_downtime_us;
+static u32 downtime_ts;			// "Downtime" in ticks
+static float last_downtime_us;		// Latest downtime in usec
 
-static bool test_req = false;
+static bool test_req = false;		// Should we start a 10-second test?
 
+// A sample taken by the SI polling interrupt handler
 struct sample
 {
 	u32 cb_ts;	// Ticks when callback was fired
@@ -60,18 +35,43 @@ struct sample
 	u32 pressed;	// Was the 'A' button pressed? (1=yes)
 };
 
-float clicks[2000];
-u32 click_idx = 0;
-
+float clicks[2000];			// Array of click times
+u32 click_idx = 0;			// ... cursor
 
 struct sample last_sample;		// The previous sample
 struct sample cur_sample;		// The current sample
 
-u32 press_start_ts;			// Ticks at the rising edge
-float last_press_time_us;
-float best_press_time_us = 1000000;
+u32 press_start_ts;			// Ticks at rising edge of 'A' press
+float last_press_time_us;		// Last recorded click time
+float best_press_time_us = 1000000;	// Best (shortest) click time
 
 PADStatus status[4];			// Array of per-controller input data
+
+
+// Typical libogc initialization
+u32 gettick(void);
+u64 gettime(void);
+void init()
+{
+	VIDEO_Init();
+	PAD_Init();
+	rmode = VIDEO_GetPreferredMode(NULL);
+
+	xfb = MEM_K0_TO_K1(SYS_AllocateFramebuffer(rmode));
+	console_init(xfb, 20, 20, rmode->fbWidth, rmode->xfbHeight,
+			rmode->fbWidth*VI_DISPLAY_PIX_SZ);
+
+	VIDEO_Configure(rmode);
+	VIDEO_SetNextFramebuffer(xfb);
+	VIDEO_SetBlack(FALSE);
+	VIDEO_Flush();
+
+	VIDEO_WaitVSync();
+	if(rmode->viTVMode&VI_NON_INTERLACE)
+		VIDEO_WaitVSync();
+}
+
+// An SI callback, called when a polling interrupt is handled.
 void si_cb()
 {
 	// If we're currently recording data
@@ -98,7 +98,6 @@ void si_cb()
 				best_press_time_us = last_press_time_us;
 			clicks[click_idx] = last_press_time_us;
 			click_idx++;
-
 		}
 
 		last_sample = cur_sample;
@@ -111,6 +110,7 @@ void si_cb()
 	}
 }
 
+// Per-frame display during 10-second tests
 void write_stats()
 {
 	printf("\x1b[10;0H");
@@ -133,11 +133,8 @@ void write_stats()
 
 	printf("\x1b[17;0H");
 	printf("Total clicks:        %08d", total_clicks);
-
-
 	printf("\n");
 }
-
 
 // Mark the beginning of a sampling window.
 void start_window()
@@ -154,24 +151,24 @@ void start_window()
 // Mark the end of a sampling window.
 void stop_window()
 {
+	// Stop recording
 	recording = false;
 
 	// Start recording how much downtime until the start of a new window
 	downtime_ts = gettick();
 }
 
+// Count down for 10 seconds, then clear the screen
 void do_countdown()
 {
 	u32 start_ts;
 	u32 target_ms = 10000;
 	u32 current_ms = 0;
-
+	float cur_s;
 
 	printf("Counting down from 10 ...\n");
-
 	VIDEO_WaitVSync();
 	start_ts = gettick();
-	float cur_s;
 	while (1)
 	{
 		current_ms = ticks_to_ms(gettick() - start_ts);
@@ -192,20 +189,21 @@ void do_countdown()
 	printf("\x1b[0;0H");
 }
 
+// Actually do a 10-second sampling test
 void do_test()
 {
 	u32 start_ts;
-	// By serializing the start of the mainloop with vsync, we can ensure 
+
+	// By serializing the start of the mainloop with vsync, we can ensure
 	// that the first window will be aligned to the boundary of a frame.
 
 	VIDEO_WaitVSync();
 
 	start_ts = gettick();
-	while(1) 
+	while(1)
 	{
 		// Here, the polling handler will sample controller input
 		// until we arrive at the next vertical blanking period.
-		// With the sampling rate at 1ms, this means 16 samples.
 
 		start_window();
 		VIDEO_WaitVSync();
@@ -228,11 +226,10 @@ void do_test()
 	}
 	click_length_avg_us = click_length_avg_us / total_clicks;
 	printf("Avg click took:      %.3fms\n", click_length_avg_us/1000);
-
 	printf("Press START to [re]start sampling for 10 seconds.\n");
 }
 
-
+// Reset some state
 void cleanup()
 {
 	click_idx = 0;
@@ -241,7 +238,6 @@ void cleanup()
 	best_press_time_us = 1000000;
 	memset(clicks, 0, sizeof(clicks));
 }
-
 
 // Main loop
 int main(int argc, char **argv)
@@ -257,25 +253,28 @@ int main(int argc, char **argv)
 	printf("Press START to [re]start sampling for 10 seconds.\n");
 	sleep(1);
 
-
+	// Register a callback fired on SI interrupts.
 	SI_RegisterPollingHandler(si_cb);
-	VIDEO_WaitVSync();
 
-	while(1) 
+	VIDEO_WaitVSync();
+	while(1)
 	{
-		// Start a test
+		// Let START presses begin a 10-second test
 		if (test_req)
 		{
+			// Clear old state
 			cleanup();
+
+			// Reset cursor and console
 			printf("\x1b[2J");
 			printf("\x1b[0;0H");
 			printf("Starting test...\n");
-			// Countdown from 10
+
+			// Countdown from 10, then do the test loop
 			do_countdown();
 			do_test();
 		}
 		VIDEO_WaitVSync();
 	}
-
 	return 0;
 }
